@@ -75,6 +75,49 @@ _canresize(PyByteArrayObject *self)
     return 1;
 }
 
+static int
+_reallocate(PyObject *self, size_t alloc, size_t logical_offset, size_t size)
+{
+    void* sval;
+    PyByteArrayObject* obj = ((PyByteArrayObject*)self);
+
+    assert(self != NULL);
+    assert(PyByteArray_Check(self));
+    assert(logical_offset <= alloc);
+    assert(size >= 0);
+    assert(_canresize(obj));
+
+    if (alloc > PY_SSIZE_T_MAX) {
+        PyErr_NoMemory();
+        return -1;
+    }
+
+    if (logical_offset > 0) {
+        sval = PyObject_Malloc(alloc);
+        if (sval == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        memcpy(sval, PyByteArray_AS_STRING(self),
+            Py_MIN(size, (size_t)Py_SIZE(self)));
+        PyObject_Free(obj->ob_bytes);
+    }
+    else {
+        sval = PyObject_Realloc(obj->ob_bytes, alloc);
+        if (sval == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+    }
+
+    obj->ob_bytes = obj->ob_start = sval;
+    Py_SET_SIZE(self, size);
+    obj->ob_alloc = alloc;
+    obj->ob_bytes[size] = '\0'; /* Trailing null byte */
+
+    return 0;
+}
+
 #include "clinic/bytearrayobject.c.h"
 
 /* Direct API functions */
@@ -170,7 +213,6 @@ PyByteArray_AsString(PyObject *self)
 int
 PyByteArray_Resize(PyObject *self, Py_ssize_t requested_size)
 {
-    void *sval;
     PyByteArrayObject *obj = ((PyByteArrayObject *)self);
     /* All computations are done unsigned to avoid integer overflows
        (see issue #22335). */
@@ -215,35 +257,36 @@ PyByteArray_Resize(PyObject *self, Py_ssize_t requested_size)
             alloc = size + 1;
         }
     }
-    if (alloc > PY_SSIZE_T_MAX) {
-        PyErr_NoMemory();
+
+    return _reallocate(self, alloc, logical_offset, size);
+}
+
+int
+PyByteArray_ResizeExact(PyObject* self, Py_ssize_t requested_size)
+{
+    PyByteArrayObject* obj = ((PyByteArrayObject*)self);
+    /* All computations are done unsigned to avoid integer overflows
+       (see issue #22335). */
+    size_t alloc = (size_t)obj->ob_alloc;
+    size_t logical_offset = (size_t)(obj->ob_start - obj->ob_bytes);
+    size_t size = (size_t)requested_size;
+
+    assert(self != NULL);
+    assert(PyByteArray_Check(self));
+    assert(logical_offset <= alloc);
+    assert(requested_size >= 0);
+
+    if (requested_size == 0 && alloc <= 1) {
+        /* check this to allow __init__ and clear to be
+           called at size 0 without ever throwing a BufferError */
+        return 0;
+    }
+    if (!_canresize(obj)) {
         return -1;
     }
 
-    if (logical_offset > 0) {
-        sval = PyObject_Malloc(alloc);
-        if (sval == NULL) {
-            PyErr_NoMemory();
-            return -1;
-        }
-        memcpy(sval, PyByteArray_AS_STRING(self),
-               Py_MIN((size_t)requested_size, (size_t)Py_SIZE(self)));
-        PyObject_Free(obj->ob_bytes);
-    }
-    else {
-        sval = PyObject_Realloc(obj->ob_bytes, alloc);
-        if (sval == NULL) {
-            PyErr_NoMemory();
-            return -1;
-        }
-    }
-
-    obj->ob_bytes = obj->ob_start = sval;
-    Py_SET_SIZE(self, size);
-    obj->ob_alloc = alloc;
-    obj->ob_bytes[size] = '\0'; /* Trailing null byte */
-
-    return 0;
+    /* size + 1 for trailing null byte */
+    return _reallocate(self, size + 1, logical_offset, size);
 }
 
 PyObject *
@@ -757,7 +800,7 @@ bytearray___init___impl(PyByteArrayObject *self, PyObject *arg,
 
     if (Py_SIZE(self) != 0) {
         /* Empty previous contents (yes, do this first of all!) */
-        if (PyByteArray_Resize((PyObject *)self, 0) < 0)
+        if (PyByteArray_ResizeExact((PyObject *)self, 0) < 0)
             return -1;
     }
 
@@ -816,7 +859,7 @@ bytearray___init___impl(PyByteArrayObject *self, PyObject *arg,
                 return -1;
             }
             if (count > 0) {
-                if (PyByteArray_Resize((PyObject *)self, count))
+                if (PyByteArray_ResizeExact((PyObject *)self, count))
                     return -1;
                 memset(PyByteArray_AS_STRING(self), 0, count);
             }
@@ -831,7 +874,7 @@ bytearray___init___impl(PyByteArrayObject *self, PyObject *arg,
         if (PyObject_GetBuffer(arg, &view, PyBUF_FULL_RO) < 0)
             return -1;
         size = view.len;
-        if (PyByteArray_Resize((PyObject *)self, size) < 0) goto fail;
+        if (PyByteArray_ResizeExact((PyObject *)self, size) < 0) goto fail;
         if (PyBuffer_ToContiguous(PyByteArray_AS_STRING(self),
             &view, size, 'C') < 0)
             goto fail;
@@ -844,7 +887,7 @@ bytearray___init___impl(PyByteArrayObject *self, PyObject *arg,
 
     if (PyList_CheckExact(arg) || PyTuple_CheckExact(arg)) {
         Py_ssize_t size = PySequence_Fast_GET_SIZE(arg);
-        if (PyByteArray_Resize((PyObject *)self, size) < 0) {
+        if (PyByteArray_ResizeExact((PyObject *)self, size) < 0) {
             return -1;
         }
         PyObject **items = PySequence_Fast_ITEMS(arg);
@@ -854,7 +897,7 @@ bytearray___init___impl(PyByteArrayObject *self, PyObject *arg,
             if (!PyLong_CheckExact(items[i])) {
                 /* Resize to 0 and go through slowpath */
                 if (Py_SIZE(self) != 0) {
-                   if (PyByteArray_Resize((PyObject *)self, 0) < 0) {
+                   if (PyByteArray_ResizeExact((PyObject *)self, 0) < 0) {
                        return -1;
                    }
                 }
@@ -1143,7 +1186,7 @@ static PyObject *
 bytearray_clear_impl(PyByteArrayObject *self)
 /*[clinic end generated code: output=85c2fe6aede0956c input=ed6edae9de447ac4]*/
 {
-    if (PyByteArray_Resize((PyObject *)self, 0) < 0)
+    if (PyByteArray_ResizeExact((PyObject *)self, 0) < 0)
         return NULL;
     Py_RETURN_NONE;
 }
